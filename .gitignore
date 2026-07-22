@@ -1,0 +1,7 @@
+x64/
+Debug/
+Release/
+*.user
+*.obj
+*.ifc
+*.dt
