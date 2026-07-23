@@ -1,7 +1,11 @@
 x64/
 Debug/
 Release/
+.vs/
 *.user
 *.obj
 *.ifc
 *.dt
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
