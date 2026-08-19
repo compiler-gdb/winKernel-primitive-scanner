@@ -39,7 +39,7 @@ export namespace WinKernel::Worker {
 
         std::vector<uint8_t> basePayload(WinKernel::Constants::DEFAULT_BUFFER_SIZE, 0x41);
         std::vector<uint8_t> outputBuffer(1024, 0x00);
-
+         
         uint64_t iteration = 0;
         auto startTime = std::chrono::steady_clock::now();
 
