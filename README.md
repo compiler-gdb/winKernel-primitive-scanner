@@ -149,6 +149,9 @@ Windows 커널 드라이버의 취약점 및 통신 원시 패턴(Primitives)을
 ## Architecture
 
 **`WinKernel.Driver.ixx`**: 비동기 Overlapped IOCTL 통신 및 IRP 라이프사이클 관리
+
 **`WinKernel.Process.ixx`**: 개별 Worker 프로세스 생성, 상태 추적 및 핸들 캡슐화
+
 **`WinKernel.Manager.ixx`**: 코어 수 기반 병렬 워커 풀 관리, CPU 진척도 모니터링, 폭주 방어
+
 **`WinKernel.Types.ixx`**: 공용 상태 머신(WorkerState) 및 공유 구조체 정의
