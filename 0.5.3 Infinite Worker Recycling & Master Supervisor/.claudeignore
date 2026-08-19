@@ -1,0 +1,9 @@
+# .claudeignore
+.vs/
+x64/
+Debug/
+Release/
+build/
+fuzz_session_*/
+*.dmp
+*.log

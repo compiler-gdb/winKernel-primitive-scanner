@@ -1,0 +1,13 @@
+# Claude Code Artifacts
+.claude/
+.claudeignore
+CLAUDE.md
+
+# Visual Studio & VS Code User Environments
+.vs/
+.vscode/
+*.user
+*.suo
+x64/
+Debug/
+Release/
