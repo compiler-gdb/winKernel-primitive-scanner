@@ -2,15 +2,8 @@ This project is for educational and vulnerability research purposes only. It is 
 
 본 프로젝트는 교육 및 취약점 연구 목적으로만 제공됩니다. 보안 연구원과 개발자가 커널 드라이버의 취약점을 이해하고 시스템의 안정성을 평가하는 데 도움을 주기 위해 설계되었습니다. 본 소프트웨어의 오용 또는 이로 인해 발생하는 직간접적인 손해에 대해 저자는 어떠한 법적 책임도 지지 않습니다.
 
----
-## WinKernel Primitive Scanner
-
-### Overview
-
-Windows 커널 드라이버의 취약점 및 통신 원시 패턴(Primitives)을 병렬로 진단하는 멀티프로세스 기반 스캐너입니다. Master Supervisor가 다중 Worker Process의 생명주기를 감시하며, 예외 발생 시 자가 복구 및 드라이버 I/O 안정성을 유지합니다.
-
----
-### 0.2.0 -> 0.3.0
+-----------
+0.2.0 -> 0.3.0
 
 **마스터-워커 멀티프로세싱 아키텍처 도입**
 
@@ -25,7 +18,7 @@ Windows 커널 드라이버의 취약점 및 통신 원시 패턴(Primitives)을
 **독립적인 세션 로깅:** 세션별 고유 디렉토리를 생성하고, 워커별로 독립된 파일(Process_N)에 기록을 남기는 FuzzLogger 연동.
 
 ---
-### 0.3.0 -> 0.4.0
+0.3.0 -> 0.4.0
 
 **비동기(Overlapped) I/O 및 워커 자체 회복(Self-Healing) 로직 적용**
 
@@ -41,7 +34,7 @@ Windows 커널 드라이버의 취약점 및 통신 원시 패턴(Primitives)을
 
 ---
 
-### 0.4.0 -> 0.5.0
+0.4.0 -> 0.5.0
 
 **무한 워커 재활용(Worker Recycling) 및 마스터 수퍼바이저(Supervisor) 고도화**
 
@@ -57,7 +50,7 @@ Windows 커널 드라이버의 취약점 및 통신 원시 패턴(Primitives)을
 
 ---
 
-### 0.5.0 -> 0.5.1
+0.5.0 -> 0.5.1
 
 **1. 멀티코어 CPU 자원 할당 정책 최적화 및 퍼징 처리량 극대화**
 마스터 프로세스의 워커 할당 공식을 개선하여, 고사양 가상머신(VM) 및 멀티코어 환경에서 시스템 안정성을 해치지 않으면서 퍼징 화력을 최대치로 끌어올린 패치 버전입니다.
@@ -76,7 +69,7 @@ Windows 커널 드라이버의 취약점 및 통신 원시 패턴(Primitives)을
 
 ---
 
-### 0.5.1 -> 0.5.2
+0.5.1 -> 0.5.2
 
 **1. 마스터 프로세스 감시 루프 논블로킹 전환 (Wait(0))**
 
@@ -100,7 +93,7 @@ Windows 커널 드라이버의 취약점 및 통신 원시 패턴(Primitives)을
 
 ---
 
-### 0.5.2 -> 0.5.3
+0.5.2 -> 0.5.3
 
 **1) 아키텍처 모듈화 및 단일 책임 원칙(SRP) 확립**
 **`main.cpp` 경량화 (CLI 라우터화):** main.cpp에 집중되어 있던 마스터/워커 실행 루프와 설정을 분리하여, 명령행 인자(`--worker`)에 따라 분기하는 순수 진입점(Entry Point, ~20줄)으로 축소.
@@ -126,32 +119,3 @@ Windows 커널 드라이버의 취약점 및 통신 원시 패턴(Primitives)을
 **기본 페이로드 버퍼 확장 (4096 바이트):** HEVD(x64) 스택 버퍼 크기($0x800$, 2048 바이트)를 안정적으로 초과하여 커널 패닉(BSOD / BugCheck)을 유발할 수 있도록 `DEFAULT_BUFFER_SIZE`를 4096 바이트로 상향.
 
 **워커 수명 주기 최적화 (700만 회):** 프로세스 재생성 오버헤드를 줄이고 장기 가동률을 극대화하기 위해 워커 리사이클 주기를 7,000,000회로 확장.
-
----
-
-### 0.5.3 -> 0.5.4
-
-**Fault-Tolerant Driver Pipeline:**
-비동기 I/O 타임아웃 발생 시 `CancelIo` 직후 `GetOverlappedResult`를 동기 대기(Drain)하여 IRP 잔류 및 스택 메모리 오염 원천 방지.
-
-**Adaptive CPU Time Hang Detection:**
-30초 단순 고정 타이머 대신 `GetProcessTimes` API를 활용하여 워커의 실제 CPU 진척도를 추적, 무한 루프/데드락 발생 시 정밀 감지 및 재활용(Recycle).
-
-**CrashLoop Spawn Storm Guard:**
-정상 종료(`exitCode == 0`)가 아닌 비정상 크래시 루프 상황에서만 폭주 카운터가 증가하도록 방어 로직 격리.
-
-**Robust Resource Lifecycle:**
-핸들 센티널을 `nullptr`로 일원화하고 `CloseHandle` 누수를 차단하여 대규모 장기 스캔 시 안정성 확보.
-가용 코어 연산 시 부호 없는 정수(unsigned) 언더플로우 방어 가드 적용.
-
----
-
-## Architecture
-
-**`WinKernel.Driver.ixx`**: 비동기 Overlapped IOCTL 통신 및 IRP 라이프사이클 관리
-
-**`WinKernel.Process.ixx`**: 개별 Worker 프로세스 생성, 상태 추적 및 핸들 캡슐화
-
-**`WinKernel.Manager.ixx`**: 코어 수 기반 병렬 워커 풀 관리, CPU 진척도 모니터링, 폭주 방어
-
-**`WinKernel.Types.ixx`**: 공용 상태 머신(WorkerState) 및 공유 구조체 정의

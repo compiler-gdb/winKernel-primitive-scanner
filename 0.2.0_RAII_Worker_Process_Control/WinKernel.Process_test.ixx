@@ -3,7 +3,6 @@
 
 module;
 #include <Windows.h>
-#include <string>	// [추가] Launch()의 std::wstring 가변 버퍼용
 
 export module WinKernel.Process;
 
@@ -55,13 +54,13 @@ export namespace WinKernel::Process {
 			state_만 원본을 Idle로 바꾸는 이유는?
 			hProcess_나 Thread_는 윈도우 시스템이 관리하는 포인터/핸들 자원이지만 state_는 포인터가 아니라 상태를 나타내는 데이터입니다.(열거형/Enum) 그러므로 아무것도 안한다는 Idle로 초기화합니다.
 			*/
-		// WorkerProcess라는 클래스 타입의 객체를 전달받는 other 변수.
-		WorkerProcess(WorkerProcess&& other) noexcept	// noexcept: 사용자는 이 함수는 무조건 에러가 터지지 않을거라하여 컴파일러가 일단 실행하고, 예외 발생 시 즉시 강제 종료.
+		// 인자로 전달받을 other는 private에서 지정한 WorkerProcess의 형식을 따릅니다.
+		WorkerProcess(WorkerProcess&& other) noexcept
 			: id_(other.id_), hProcess_(other.hProcess_), hThread_(other.hThread_),
 			processId_(other.processId_), state_(other.state_) {
 			other.hProcess_ = NULL;
 			other.hThread_ = NULL;
-			other.state_ = WinKernel::Types::WorkerState::Idle;			// Process.ixx 내의 함수들에 따른 state_ 변화에 따라 맨 아래의 GetState의 반환 값이 달라집니다.
+			other.state_ = WinKernel::Types::WorkerState::Idle;
 		}
 
 		//자식 워커 프로세스를 실행합니다.
@@ -73,12 +72,9 @@ export namespace WinKernel::Process {
 			PROCESS_INFORMATION pi{};
 
 			// const wchar_t*를 CreateProcessW에 전달하기 위해 변환
-			// [삭제] wchar_t buffer[MAX_PATH]; wcscpy_s(buffer, cmdLine);
-			// [수정] MAX_PATH(260) 고정 스택 버퍼 대신, 길이에 맞춰 힙에 할당되는 가변 버퍼 사용.
-			std::wstring buffer = cmdLine;
+			wchar_t buffer[MAX_PATH];
+			wcscpy_s(buffer, cmdLine);
 
-
-			//CreateProcessW 구조
 			/*
 				in: 함수 안으로 데이터를 넣어주는 역할.
 				out: 함수가 결과를 담아서 내보내주는 역할.
@@ -95,25 +91,8 @@ export namespace WinKernel::Process {
 				  [in]                LPSTARTUPINFOA        lpStartupInfo,
 				  [out]               LPPROCESS_INFORMATION lpProcessInformation
 				);
-				*/ 
-			// [수정] CreateProcessW에서 buffer를 buffer.data()로 수정했습니다.
-			/*
-			왜 std::wstring buffer = cmdLine;이 '제한 없는 버퍼'인가? (메모리 구조의 차이)
-			기존 방식과 새로운 방식은 메모리를 할당하는 위치와 방식이 완전히 다릅니다.
-
-			기존 방식 (wchar_t buffer[MAX_PATH]):
-			스택(Stack) 메모리에 무조건 260칸(520바이트)짜리 고정 상자를 만듭니다.
-			wcscpy_s는 복사하려는 문자열(cmdLine)이 260칸을 1글자라도 넘어서면 버퍼 오버플로우를 막기 위해 프로세스를 강제로 즉시 폭파(Abort)시킵니다.
-
-			새로운 방식 (std::wstring buffer = cmdLine;):
-			C++ 표준 문자열 객체는 실행 시점에 cmdLine의 실제 길이를 스스로 측정합니다.
-			문자열이 100자든, 1,000자든 그 길이에 딱 맞는 크기의 힙(Heap) 메모리를 동적으로 알아서 할당하여 담아냅니다.
-			따라서 길이가 아무리 길어져도 용량 부족으로 프로그램이 터지는 일이 원천적으로 사라집니다.
-
-			buffer -> buffer.data()
-			CreateProcessW는 두 번째 인자가 LPWSTR lpCommandLine인데 const가 없는 수정 가능한 메모리를 요구합니다. buffer를 그대로 넣는다면 const wchar_t*(읽기 전용 포인터)가 반환되어 전달이 불가합니다. buffer.data()는 stdLLwstring 내부의 수정 가능한 원본 메모리 주소를 반환합니다.
-			*/
-			if (!CreateProcessW(NULL, buffer.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+				*/ //CreateProcessW 구조
+			if (!CreateProcessW(NULL, buffer, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
 				state_ = WinKernel::Types::WorkerState::Crashed;
 				return false;
 			}
@@ -131,7 +110,7 @@ export namespace WinKernel::Process {
 
 			DWORD exitCode = 0;
 			if (GetExitCodeProcess(hProcess_, &exitCode)) {
-				return exitCode == STILL_ACTIVE;			//STILL_ACTIVE: 프로세스 실행 중 상태
+				return exitCode == STILL_ACTIVE;
 			}
 			return false;
 		}
@@ -141,8 +120,8 @@ export namespace WinKernel::Process {
 			if (hProcess_ == NULL) return false;
 
 			DWORD waitResult = WaitForSingleObject(hProcess_, timeoutMs);
-			if (waitResult == WAIT_OBJECT_0) {				//WAIT_OBJECT_0: 대기하던 대상이 정상적 종료함을 확인. WaitForSingleObject로 막은 스레드를 풀고 다음 코드를 실행하라.
-				state_ = WinKernel::Types::WorkerState::Finished; // main에서 완료된 워커이면 continue할 수 있도록 상태를 변경합니다.
+			if (waitResult == WAIT_OBJECT_0) {
+				state_ = WinKernel::Types::WorkerState::Finished;
 				return true;
 			}
 			// WAIT_TIMEOUT 등 대기 시간 초과
@@ -166,55 +145,13 @@ export namespace WinKernel::Process {
 				hThread_ = NULL;
 			}
 			if (hProcess_) {
-				// Close()가 프로세스 핸들을 닫지 않습니다. (핸들 누수)
-				// [수정] CloseHandle(hProcess_);추가.
-				CloseHandle(hProcess_);
 				hProcess_ = NULL;
 			}
 			state_ = WinKernel::Types::WorkerState::Finished;
 		}
 
-		// WokerProcess: Windows 운영체제의 원시적인 자원(HANDLE, PID)을 C++ 객체지향의 형태로 안전하게 포장해놓은 프로세스 관리 대리인.
-		WorkerProcess& operator=(WorkerProcess&& other) noexcept { // WorkerProcess&& other에서 &&란? std::move로 인해 곧 파괴될 임시 객체를 참조합니다.
-			// 1. 자기 자신에게 대입하는지 확인 (w = std::move(w) 방지)
-			if (this != &other) {
-				// [삭제]
-				// if (hProcess_ != INVALID_HANDLE_VALUE) {
-				// 	CloseHandle(hProcess_);
-				// }
-				// if (hThread_ != INVALID_HANDLE_VALUE) {
-				// 	CloseHandle(hThread_);
-				// }
-				// [수정] 내가 기존에 들고 있던 프로세스 핸들이 있다면 먼저 닫기 (Close 함수 활용 또는 nullptr 검사)
-				Close();
-
-				// 3. other(새 워커)의 자원과 상태를 내 것으로 훔쳐오기 (소유권 이전)
-				id_ = other.id_; // [추가]
-				hProcess_ = other.hProcess_;
-				hThread_ = other.hThread_;
-				processId_ = other.processId_;
-				state_ = other.state_;
-				// (주의: 만약 WorkerProcess 안에 다른 멤버 변수가 더 있다면 여기에 똑같이 추가해 주세요)
-
-				// 4. other(새 워커)는 빈 껍데기로 초기화하여, 소멸될 때 핸들이 닫히지 않도록 보호
-				// [삭제]-아래 2line
-				// other.hProcess_ = INVALID_HANDLE_VALUE;
-				// other.hThread_ = INVALID_HANDLE_VALUE;
-
-				//수정
-				other.id_ = 0;
-				other.hProcess_ = nullptr;
-				other.hThread_ = nullptr;
-				other.processId_ = 0;
-				other.state_ = WinKernel::Types::WorkerState::Idle;	// 이동 생성자와 동일한 센티널(Idle)로 통일
-			}
-			return *this; // this: 자기 자신의 메모리 주소(포인터), *this: 포인터가 가리키는 자기 자신(객체 실체)
-		}
-
 		//상태 확인
 		DWORD GetPID() const { return processId_; }
-		// [추가] Manager의 Hang 감지(GetProcessTimes)/종료코드 조회용 프로세스 핸들 접근자
-		HANDLE GetProcessHandle() const { return hProcess_; }
 		//WinKernel::Types::WorkerState는 반환 타입입니다.
 		WinKernel::Types::WorkerState GetState() const { return state_; }
 	};
