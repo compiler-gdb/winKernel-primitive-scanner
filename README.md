@@ -119,3 +119,34 @@ This project is for educational and vulnerability research purposes only. It is 
 **기본 페이로드 버퍼 확장 (4096 바이트):** HEVD(x64) 스택 버퍼 크기($0x800$, 2048 바이트)를 안정적으로 초과하여 커널 패닉(BSOD / BugCheck)을 유발할 수 있도록 `DEFAULT_BUFFER_SIZE`를 4096 바이트로 상향.
 
 **워커 수명 주기 최적화 (700만 회):** 프로세스 재생성 오버헤드를 줄이고 장기 가동률을 극대화하기 위해 워커 리사이클 주기를 7,000,000회로 확장.
+
+---
+0.5.3 -> 0.5.4
+
+**1) 안정성 및 크래시루프(CrashLoop) 방어 체계**
+
+**드라이버 사전 검사 (Pre-Flight Check):** 마스터 프로세스 기동 즉시 타깃 드라이버 연결 가능 여부를 1회 검증하여, 드라이버 미로드 상태일 경우 워커 생성 없이 0초 만에 안전 종료(Abort).
+
+**전역 프로세스 폭주 감시 (Global Crash Guard):** 워커가 비정상 조기 종료되어 무한 재생성(Fork Storm)되는 것을 방지하기 위해, 1초 윈도우 내 누적 10회 이상 조기 종료 감지 시 마스터가 모든 워커를 강제 종료하고 즉시 중단.
+
+**폭주 카운터 오탐 수정:** 기존에는 Wait(0)이 참이 되는 즉시(정상 종료 포함) 무조건 카운터를 증가시켰음. exitCode != 0(비정상 종료)일 때만 카운트하도록 조건 추가.
+
+<br><br>
+**2) 행(Hang) 감시 로직 CPU 시간 기반으로 전면 교체**
+**기존 문제:** 50ms 루프 × 600틱(30초) 고정 타임아웃 - 워커가 700만 회를 정상적으로 퍼징 중이어도 30초가 지나면 무조건 강제 종료(오탐 Kill).
+**수정 후:** GetProcessTimes()로 워커의 커널+유저 CPU 누적 시간을 매 틱마다 비교. CPU 시간이 계속 증가 중이면(=실제로 일하는 중) 카운터를 리셋, 30초 동안 CPU 시간이 단 1ms도 움직이지 않을 때만 진짜 Hang으로 판정해 종료.
+워커 재생성 시 lastCpuTimes 베이스라인을 0으로 초기화하여 새 워커가 이전 워커의 CPU 누적치로 인해 오탐되는 것을 방지.
+
+<br><br>
+**3) 프로세스 자원 관리 (WinKernel_Process.ixx)**
+
+**핸들 누수 수정:** Close()에서 hThread_만 닫고 hProcess_는 닫지 않던 버그 수정 → CloseHandle(hProcess_) 추가.
+
+**이동 대입 연산자 버그 수정:** 잘못된 센티널 값(INVALID_HANDLE_VALUE) 비교 로직을 제거하고 Close() 재사용으로 통일. 기존에 누락되어 있던 id_ 멤버 이전(transfer) 추가. 이동 후 원본 객체의 핸들을 nullptr + WorkerState::Idle로 통일해 이동 생성자와의 상태 불일치 제거.
+
+**커맨드라인 버퍼 오버플로우 방지:** Launch()에서 고정 크기 스택 버퍼(wchar_t[MAX_PATH], 260자) 대신 std::wstring 가변 버퍼 사용. 기존에는 커맨드라인이 260자를 넘기면 wcscpy_s가 프로세스를 강제 Abort시켰음.
+
+**Hang 감지용 접근자 추가:** Manager의 CPU 시간 기반 Hang 판정이 가능하도록 GetProcessHandle() 게터 추가.
+
+**4) 정수 언더플로우 방지 (WinKernel_Manager.ixx)**
+WorkerManager() 기본 생성자와 MasterController::Run()의 코어 수 계산에서, hardware_concurrency() / GetLogicalCoreCount()가 2 이하를 반환할 경우 DWORD(unsigned) 뺄셈으로 인한 언더플로우(거대한 양수 발생 → 워커 수 폭주)를 삼항 연산자로 원천 차단.
