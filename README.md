@@ -150,3 +150,75 @@ This project is for educational and vulnerability research purposes only. It is 
 
 **4) 정수 언더플로우 방지 (WinKernel_Manager.ixx)**
 WorkerManager() 기본 생성자와 MasterController::Run()의 코어 수 계산에서, hardware_concurrency() / GetLogicalCoreCount()가 2 이하를 반환할 경우 DWORD(unsigned) 뺄셈으로 인한 언더플로우(거대한 양수 발생 → 워커 수 폭주)를 삼항 연산자로 원천 차단.
+
+---
+
+0.5.4 -> 0.6.0
+파일 기반 IPC를 통째로 폐기, TCP + VM 스냅샷 리셋 루프로 재설계
+
+**1) VM 스냅샷 자동 복구 루프 (monitoring.py 신규)**
+
+**크래시 발생 시 자동 되돌리기:** 매 라운드마다 revertToSnapshot으로 VM을 클린 상태로 되돌린 뒤 전원을 켜고, VMware Tools 초기화를 대기(wait_for_tools)한 다음 퍼저 워커 exe를 게스트에 재주입(stage_worker_to_local)하고 실행.
+
+**BSOD 판정:** 게스트에 VMware Tools가 응답하는지(guest_tools_alive)로 크래시 여부를 판단. 초기 정착 시간(initial_settle) + 유예 시간(grace_seconds) 동안 연속 정상 응답(healthy_streak)이 없으면 다운(BSOD)으로 확정(confirm_guest_down).
+
+**무한 루프화:** 크래시 발생 → 유죄 시드 저장 → 리버트 → 재실행을 Ctrl+C 전까지 반복.
+
+<br><br>
+**2) 파일/HGFS 기반 IPC 전면 폐기 → TCP 소켓 리포팅**
+
+**온-와이어 프로토콜 신설 (WinKernel_IPC.ixx):** FuzzReportPacket(304바이트 고정 POD, #pragma pack(1))을 정의해 워커→호스트 단방향 스트리밍. Python 쪽은 struct.Struct("<8IQ2I256s")로 1:1 언패킹.
+
+**TcpReporter 클라이언트 추가:** 워커가 시작 시 호스트(monitoring.py)에 접속하고, DeviceIoControl 호출 직전마다 현재 시드/IOCTL/페이로드 스냅샷을 전송. TCP_NODELAY로 Nagle 지연을 제거해 BSOD 직전 마지막 패킷이 커널 버퍼에 갇히지 않도록 함.
+
+**유죄 시드 귀속 원리 변경:** 기존엔 공유 메모리/HGFS에 상태를 기록해 뒤늦게 pull 했지만, 이제는 소켓이 끊기는 순간(BSOD) 호스트가 이미 들고 있던 "마지막 InIoctl 패킷"이 곧 유죄 후보가 됨 (디스크 경유 없음 → revert 시 소실 위험 제거).
+리포트 채널 미연결 시 안전 종료: 호스트와 연결 안 되면 DeviceIoControl을 아예 쏘지 않고 워커를 종료 → 귀속 불가능한 크래시 방지.
+
+<br><br>
+**3) 호스트 주도 결정론적 시드/커서 시스템**
+
+fuzz_cursor.txt에 base_seed/start_ioctl을 영속화하여, VM을 리버트해도 이전 라운드 진행 지점부터 재현 가능하게 함.
+
+워커별 시드는 base_seed + workerId로 충돌 없이 분배, 커맨드라인에 0xSEED <startIoctl> --report-host <h> --report-port <p>로 전달.
+
+main.cpp에 --base-seed, --start-ioctl, --report-host, --report-port 인자 파싱 추가 (마스터/워커 공통).
+
+<br><br>
+**4) 유저모드 SEH 자가 회복 (WinKernel_Worker.ixx)**
+
+SendIoctlGuarded() 함수로 DeviceIoControl 호출을 __try/__except로 감싸, 커널이 반환한 OS 레벨 예외(0xC0000005 등)를 프로세스 크래시 없이 흡수하고 다음 반복으로 자가 복귀.
+
+동일 (IOCTL, Seed) 조합은 워커 생애당 1회만 Crashed 리포트 → 호스트 측 중복 덤프 방지.
+
+흡수된 예외 로그는 첫 발생 + 1000회 단위로만 기록해 핫패스 로그 폭주 방지.
+
+<br><br>
+**5) 마스터 감시 루프 재설계 (WinKernel_Manager.ixx)**
+
+**자폭(Fork Storm Abort) 트리거 폐기:** 동시 다발적 워커 종료는 인프라 오류가 아니라 "드라이버 전멸(BSOD 진행 중)" 신호일 수 있으므로, 마스터가 스스로 종료하지 않고 경고 로그만 남긴 뒤 계속 재기동.
+
+**Mass Hang(전역 정지) 판정 추가:** 과반 워커가 동시에 CPU 진척 없이 멈추면 개별 Hang이 아니라 커널 전체가 죽어가는 중(지연 BSOD, 0x1E)으로 간주해 어떤 워커도 강제 종료하지 않고 무한 대기.
+
+**개별 Hang 강제 종료 로직 제거:** 기존 30초 CPU 무진척 시 즉시 Kill하던 로직을 삭제하고, 대신 ~20분 무진척 시 진단 로그 1회만 남기고 방치(지연 BSOD 완성을 위해 워커를 살려둠).
+
+<br><br>
+**6) 드라이버 사전 검사 진단 강화**
+
+DriverController::LastError() 추가로 CreateFileW 실패 원인(ERROR_FILE_NOT_FOUND=미로드, ERROR_ACCESS_DENIED=권한부족)을 구분.
+IsProcessElevated()로 현재 프로세스의 관리자 권한 여부를 함께 진단 로그에 출력.
+ 
+<br><br>
+**7) 페이로드 크기 고정**
+
+가변 크기 이스케일레이션 로직을 제거하고, 모든 IOCTL 페이로드를 DEFAULT_BUFFER_SIZE(4096, PAGE_SIZE)로 고정 — 해당 크기에서 취약점이 직격 재현됨을 확인.
+
+<br><br>
+**8) 기타 안정성 보강**
+
+wmain 전체를 try/catch로 감싸 예외 발생 시 크래시 대신 코드 99/98로 안전 종료.
+
+로케일 설정(std::locale::global)을 try/catch로 래핑해 POSIX 로케일 문자열 오류로 인한 즉시 크래시 방지.
+
+WinKernel_Types.ixx에 센티널 정책 기반 RAII 핸들 래퍼(UniqueHandle, MappedView) 및 CrashClass(Benign/Crash/Hang) enum 추가 — 향후 핸들 누수 차단 및 크래시 분류 확장 대비.
+
+monitoring.py에 TCP 리포트 포트용 방화벽 인바운드 규칙 자동 등록(ensure_firewall_inbound) 추가.
