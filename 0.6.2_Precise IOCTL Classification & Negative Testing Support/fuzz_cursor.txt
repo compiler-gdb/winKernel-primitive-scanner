@@ -1,0 +1,2 @@
+start_ioctl=0
+base_seed=0x00224A04

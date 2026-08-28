@@ -1,0 +1,17 @@
+# WinKernel Fuzzer - 로컬 자격 증명/환경 설정 (P5: 절대 커밋 금지)
+# 실제 값이 담긴 fuzzer.env 는 추적 제외. 커밋되는 템플릿은 fuzzer.env.example 이다.
+fuzzer.env
+
+# Claude Code Artifacts
+.claude/
+.claudeignore
+CLAUDE.md
+
+# Visual Studio & VS Code User Environments
+.vs/
+.vscode/
+*.user
+*.suo
+x64/
+Debug/
+Release/
