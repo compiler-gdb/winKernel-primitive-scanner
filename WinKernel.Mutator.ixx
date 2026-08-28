@@ -102,6 +102,60 @@ export namespace WinKernel::Mutator {
 			std::memcpy(buffer.data() + targetPos, &boundaryVal, sizeof(uint32_t));
 		}
 
+		// [가변 크기 퍼징] 다음 페이로드 크기를 [minSize, maxSize] 범위에서 결정론(rng_ 시드 기반)으로 선택.
+		// 1/4 확률로 커널 버퍼 경계 부근의 '흥미로운 크기'를, 나머지는 균등 분포를 사용한다.
+		// 경계값 배열(정수 오버플로우 유도)과 같은 취지로, 크기 축에서도 오프바이원/임계 지점을 집중 타격한다.
+		uint32_t NextSize(uint32_t minSize, uint32_t maxSize) {
+			if (maxSize <= minSize) return minSize;
+
+			// 커널 스택 버퍼(HEVD BufferOverflowStack = 512*4 = 2048B) 임계 주변 및 페이지 경계.
+			static constexpr uint32_t INTERESTING_SIZES[] = {
+				1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024,
+				2047, 2048, 2049, 3072, 4095, 4096, 4097, 6144, 8191, 8192
+			};
+
+			std::uniform_int_distribution<int> pickDist(0, 3);
+			if (pickDist(rng_) == 0) {
+				std::uniform_int_distribution<size_t> idxDist(0, std::size(INTERESTING_SIZES) - 1);
+				uint32_t s = INTERESTING_SIZES[idxDist(rng_)];
+				if (s < minSize) s = minSize;
+				if (s > maxSize) s = maxSize;
+				return s;
+			}
+
+			std::uniform_int_distribution<uint32_t> sizeDist(minSize, maxSize);
+			return sizeDist(rng_);
+		}
+
+		// [실무형 구조적 랜덤 IOCTL] IOCTL 코드를 코퍼스 기반으로 '재현 가능'하게 생성(rng_ 시드 스트림 사용).
+		//   exploitPct% 확률로 알려진 유효 코드(corpus)를 재사용(exploitation)하고,
+		//   나머지는 CTL_CODE 구조를 지켜 인접 공간을 탐색(exploration)한다:
+		//     - device type 은 타깃 대역으로 고정(무의미한 완전 랜덤 방지),
+		//     - Function 은 [funcMin, funcMax] 무작위,
+		//     - Method 는 대부분 METHOD_NEITHER(3) 유지하되 methodRandomPct% 확률로 0~3 무작위(버퍼링 방식 불일치 탐색).
+		//   CTL_CODE 레이아웃: (DeviceType<<16) | (Access<<14) | (Function<<2) | Method. Access 는 FILE_ANY_ACCESS(0).
+		uint32_t NextIoctl(const std::vector<uint32_t>& corpus, uint32_t exploitPct,
+			uint16_t deviceType, uint32_t funcMin, uint32_t funcMax, uint32_t methodRandomPct) {
+			std::uniform_int_distribution<uint32_t> pct(0, 99);
+
+			if (!corpus.empty() && pct(rng_) < exploitPct) {
+				std::uniform_int_distribution<size_t> pick(0, corpus.size() - 1);
+				return corpus[pick(rng_)];
+			}
+
+			if (funcMax < funcMin) funcMax = funcMin;
+			std::uniform_int_distribution<uint32_t> funcDist(funcMin, funcMax);
+			const uint32_t func = funcDist(rng_);
+
+			uint32_t method = 3; // METHOD_NEITHER (HEVD 기본)
+			if (pct(rng_) < methodRandomPct) {
+				std::uniform_int_distribution<uint32_t> methodDist(0, 3);
+				method = methodDist(rng_);
+			}
+
+			return (static_cast<uint32_t>(deviceType) << 16) | (0u << 14) | ((func & 0xFFF) << 2) | (method & 0x3);
+		}
+
 		void Mutate(std::vector<uint8_t>& buffer) {
 			if (buffer.empty()) return;
 

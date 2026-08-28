@@ -220,12 +220,21 @@ export namespace WinKernel::Manager {
 		// [TCP 전환] reportHost/reportPort는 각 워커가 접속할 호스트 TCP 리스너(monitoring.py) 주소.
 		int Run(uint32_t baseSeed = 0, bool baseSeedProvided = false, size_t startIoctlIdx = 0,
 			const std::wstring& reportHost = L"127.0.0.1",
-			uint16_t reportPort = WinKernel::Constants::REPORT_PORT) {
+			uint16_t reportPort = WinKernel::Constants::REPORT_PORT,
+			// [수정] IOCTL/크기 CLI 를 자식 워커 커맨드라인으로 전파. 비어있으면 워커가 내장 기본값을 사용.
+			const std::vector<DWORD>& ioctlOverride = {},
+			uint32_t minSize = WinKernel::Constants::MIN_PAYLOAD_SIZE,
+			uint32_t maxSize = WinKernel::Constants::MAX_PAYLOAD_SIZE,
+			bool ioctlRandom = false) {
 			baseSeed_ = baseSeed;
 			baseSeedProvided_ = baseSeedProvided;
 			startIoctlIdx_ = startIoctlIdx;
 			reportHost_ = reportHost;
 			reportPort_ = reportPort;
+			ioctlOverride_ = ioctlOverride;
+			minSize_ = minSize;
+			maxSize_ = maxSize;
+			ioctlRandom_ = ioctlRandom;
 			std::wcout << std::format(L"[+] TCP report endpoint for workers: {}:{}\n", reportHost_, reportPort_);
 			if (baseSeedProvided_) {
 				std::wcout << std::format(L"[+] Host-driven deterministic scan: base-seed 0x{:08X}, start-ioctl {}\n",
@@ -306,6 +315,12 @@ export namespace WinKernel::Manager {
 		std::wstring reportHost_{ L"127.0.0.1" };
 		uint16_t reportPort_{ WinKernel::Constants::REPORT_PORT };
 
+		// [수정] 자식 워커에 전파할 IOCTL 목록/가변 크기 범위. 비어있으면 워커가 내장 기본값을 사용.
+		std::vector<DWORD> ioctlOverride_{};
+		uint32_t minSize_{ WinKernel::Constants::MIN_PAYLOAD_SIZE };
+		uint32_t maxSize_{ WinKernel::Constants::MAX_PAYLOAD_SIZE };
+		bool ioctlRandom_{ false }; // [수정] 구조적 랜덤 IOCTL 모드 전파 여부
+
 		// [Diag: 권한 진단] 현재 프로세스가 상승(관리자) 토큰인지. 드라이버 오픈 실패(err5)와 미로드(err2) 분리에 사용.
 		static bool IsProcessElevated() {
 			HANDLE tok = nullptr;
@@ -326,13 +341,23 @@ export namespace WinKernel::Manager {
 		// 형식: --worker <id> "<sessionDir>" [0xSEED <startIoctl>] --report-host <h> --report-port <p>
 		std::wstring BuildWorkerCmdLine(const wchar_t* exePath, DWORD workerId,
 			const std::wstring& sessionDir) const {
+			// [수정] IOCTL 목록/크기 범위를 커맨드라인 말미 공통 플래그로 부착(결정론/레거시 경로 공통).
+			std::wstring extra;
+			for (DWORD code : ioctlOverride_) {
+				extra += std::format(L" --ioctl 0x{:X}", code);
+			}
+			extra += std::format(L" --min-size {} --max-size {}", minSize_, maxSize_);
+			if (ioctlRandom_) {
+				extra += L" --ioctl-random";
+			}
+
 			if (baseSeedProvided_) {
 				const uint32_t seed = baseSeed_ + workerId; // 워커 간 시드 충돌 없이 재현 가능
-				return std::format(L"\"{}\" --worker {} \"{}\" 0x{:08X} {} --report-host {} --report-port {}",
-					exePath, workerId, sessionDir, seed, startIoctlIdx_, reportHost_, reportPort_);
+				return std::format(L"\"{}\" --worker {} \"{}\" 0x{:08X} {} --report-host {} --report-port {}{}",
+					exePath, workerId, sessionDir, seed, startIoctlIdx_, reportHost_, reportPort_, extra);
 			}
-			return std::format(L"\"{}\" --worker {} \"{}\" --report-host {} --report-port {}",
-				exePath, workerId, sessionDir, reportHost_, reportPort_);
+			return std::format(L"\"{}\" --worker {} \"{}\" --report-host {} --report-port {}{}",
+				exePath, workerId, sessionDir, reportHost_, reportPort_, extra);
 		}
 
 		// [TCP 전환] 모니터는 유죄 판정/영구화를 더 이상 하지 않는다(호스트가 소켓 절단+Crashed 리포트로 전담).
@@ -350,10 +375,16 @@ export namespace WinKernel::Manager {
 			constexpr DWORD LOOP_SLEEP_MS = 50;
 			constexpr int   MASS_HANG_STALL_TICKS = 40;      // 2초 연속 CPU 정지 -> 'stall'로 집계(순간 스케줄 공백 오탐 차단)
 			constexpr int   PROLONGED_DEADLOCK_DIAG_TICKS = 24000; // [Fix] 사살 아님: ~20분 무진척 시 '진단 로그 1회' 임계(워커는 방치)
+			// [Fix: P2] 고립(Isolated) Hang 재기동 임계. mass-hang 감지(2초)보다 훨씬 길고, 장기 방치 진단(~20분)보다
+			//   짧게 두어 '지연 BSOD 대기' 의도를 해치지 않으면서 고립 데드락으로 인한 처리량 저하를 회복한다.
+			constexpr int   ISOLATED_HANG_KILL_TICKS = 3600; // 50ms * 3600 = 180초(3분) 고립 정지 시 kill+respawn
 
 			// [Fix: Mass Hang 오판 방지] 동시 정지 워커가 과반이면 '드라이버 전멸(Global DoS/BSOD 진행)'로 간주하여 무한 대기.
 			const size_t massHangHalf = (workers_.size() + 1) / 2;
 			const size_t massHangThreshold = (massHangHalf < 2) ? 2 : massHangHalf;
+			// [Fix: P2] 워커가 1개뿐이면 '동시 다발(mass)' 개념 자체가 성립하지 않는다(massHangThreshold 최소 2 > 최대 정지 수 1).
+			//   이 경우 mass-hang 판정을 비활성화하고, 단일 워커 정지는 아래 고립(Isolated) Hang 경로가 kill+respawn으로 처리한다.
+			const bool massHangPossible = (workers_.size() >= 2);
 			bool massHangLatched = false; // 전역 정지 안내 로그 1회 래치(50ms 스팸 방지)
 
 			while (true) {
@@ -364,7 +395,8 @@ export namespace WinKernel::Manager {
 
 				// [Fix: Mass Hang 판정용] 이번 스캔의 정지 워커 수와 유예 만료된 고립 데드락 후보를 먼저 수집한다.
 				size_t stalledCount = 0;
-				// [Fix] 사살 후보 수집 폐기: 동시 정지 수(stalledCount)만 집계해 Mass Hang(BSOD 진행)만 판정한다.
+				// [Fix: P2] 고립(Isolated) 장기 정지 후보 인덱스. 실제 kill은 'Mass Hang이 아님'을 확인한 뒤 루프 종료 후 결정한다.
+				std::vector<size_t> isolatedHangCandidates;
 
 				for (size_t i = 0; i < workers_.size(); ++i) {
 
@@ -415,7 +447,10 @@ export namespace WinKernel::Manager {
 									// [Fix: 즉시 사살 폐기] 여기서 곧바로 죽이지 않고 정지 상태만 집계한다. 실제 사살 여부는
 									//   Mass Hang(전역 정지) 여부를 확인한 뒤 루프 종료 후 결정한다(지연 BSOD 완성 대기).
 									if (hangCounters[i] >= MASS_HANG_STALL_TICKS) stalledCount++;
-									// [Fix] 무사살 방치: 장기 무진척도 종료하지 않는다. '=='로 1회만 진단 로그(스팸 차단), 커널이 스스로 뻗을 때까지 유지.
+									// [Fix: P2] 고립 장기 정지 후보 수집. 실제 kill 여부는 Mass Hang 아님을 확인한 뒤 루프 종료 후 결정한다.
+									if (hangCounters[i] >= ISOLATED_HANG_KILL_TICKS) isolatedHangCandidates.push_back(i);
+									// [Fix: P2] 이 진단 로그(~20분)는 '고립 kill(180초)'이 Mass Hang 게이트로 계속 유보된 경우에만 도달한다.
+									//   즉 여기까지 왔다는 것은 지속적 Mass Hang 상태이므로, 커널이 스스로 뻗을 때까지 방치가 맞다. '=='로 1회만 로그(스팸 차단).
 									if (hangCounters[i] == PROLONGED_DEADLOCK_DIAG_TICKS) {
 										std::wcout << std::format(
 											L"[DIAG] Worker {} unresponsive ~{}s post-IOCTL. LEAVING it alive (NO terminate) so a delayed BSOD (0x1E) can complete.\n",
@@ -429,7 +464,7 @@ export namespace WinKernel::Manager {
 
 				// [Fix: Mass Hang 무한 대기] 과반 워커가 동시에 정지했다면 개별 인프라 문제가 아니라 드라이버 전멸(BSOD 진행)이다.
 				//   이 경우 어떤 워커도 사살하지 않고 커널 예외(BSOD)가 완성될 때까지 무한 대기한다(고립 데드락 사살도 유보).
-				if (stalledCount >= massHangThreshold) {
+				if (massHangPossible && stalledCount >= massHangThreshold) {
 					if (!massHangLatched) {
 						std::wcout << std::format(
 							L"\n[GLOBAL STALL] {}/{} workers frozen simultaneously -> driver-wide DoS / imminent BSOD.\n"
@@ -440,7 +475,25 @@ export namespace WinKernel::Manager {
 				}
 				else {
 					massHangLatched = false;
-					// [Fix] 사살 경로 제거: 고립 데드락이라도 워커를 종료하지 않는다(방치). 죽은(Exit) 워커 respawn만 위에서 수행.
+					// [Fix: P2] Mass Hang이 아닌 경우에 한해, 고립(Isolated) 장기 정지 워커를 kill+respawn 한다.
+					//   '다른 워커는 CPU 진척 중(stalledCount < 과반)'이므로 커널은 살아있고, 이 정지는 드라이버 전멸(BSOD 진행)이
+					//   아니라 순수 SW 데드락일 가능성이 높다 -> 처리량 회복을 위해 재기동. (Mass Hang 상태에서는 절대 죽이지 않음)
+					for (size_t idx : isolatedHangCandidates) {
+						auto& worker = workers_[idx];
+						if (!worker.IsRunning()) continue; // 이미 종료됐다면 다음 스캔의 exited-respawn 경로가 처리
+						std::wcout << std::format(
+							L"[ISOLATED HANG] Worker {} stalled ~{}s while other workers progress -> kill+respawn "
+							L"(likely SW deadlock, not driver-wide BSOD).\n",
+							idx, (static_cast<long long>(ISOLATED_HANG_KILL_TICKS) * LOOP_SLEEP_MS) / 1000);
+						worker.Kill(0); // TerminateProcess; 뒤이은 이동대입의 Close()가 killed 핸들을 닫는다.
+						std::wstring cmdLine = BuildWorkerCmdLine(exePath, static_cast<DWORD>(idx), sessionDir);
+						WinKernel::Process::WorkerProcess newWorker;
+						if (newWorker.Launch(static_cast<DWORD>(idx), cmdLine.c_str())) {
+							worker = std::move(newWorker);
+							hangCounters[idx] = 0;
+							lastCpuTimes[idx] = 0; // 재기동 워커 CPU 베이스라인 초기화(오탐 Hang 방지)
+						}
+					}
 				}
 
 				Sleep(LOOP_SLEEP_MS);

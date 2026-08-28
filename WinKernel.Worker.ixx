@@ -48,7 +48,14 @@ export namespace WinKernel::Worker {
     void Run(DWORD workerId, const std::wstring& sessionDir,
         bool useInjectedSeed = false, uint32_t injectedSeed = 0, size_t startIoctlIdx = 0,
         const std::wstring& reportHost = L"127.0.0.1",
-        uint16_t reportPort = WinKernel::Constants::REPORT_PORT) {
+        uint16_t reportPort = WinKernel::Constants::REPORT_PORT,
+        // [수정] IOCTL 코드를 CLI로 주입 가능하게 개방(base_seed와의 혼동 제거). 비어있으면 내장 TARGET_IOCTL_CODES 사용.
+        const std::vector<DWORD>& ioctlOverride = {},
+        // [수정] 페이로드 크기를 이 범위에서 매 반복 가변화 -> "크기 고정으로 무조건 크래시" 착시 제거.
+        uint32_t minSize = WinKernel::Constants::MIN_PAYLOAD_SIZE,
+        uint32_t maxSize = WinKernel::Constants::MAX_PAYLOAD_SIZE,
+        // [수정] opt-in 구조적 랜덤 IOCTL 모드. false(기본)면 리스트 모드로 검증 재현성을 그대로 유지한다.
+        bool ioctlRandom = false) {
         WinKernel::Logger::FuzzLogger logger(workerId, sessionDir);
         logger.Log(L"INFO", std::format(L"Worker {} started.", workerId));
 
@@ -76,11 +83,40 @@ export namespace WinKernel::Worker {
         uint32_t seed = useInjectedSeed ? injectedSeed : std::random_device{}();
         WinKernel::Mutator::MutatorEngine mutator(seed);
 
+        // [수정] 활성 IOCTL 목록: CLI 주입값이 있으면 그것을, 없으면 내장 기본 목록을 사용.
+        std::vector<DWORD> activeIoctls(ioctlOverride);
+        if (activeIoctls.empty()) {
+            activeIoctls.assign(WinKernel::Constants::TARGET_IOCTL_CODES,
+                WinKernel::Constants::TARGET_IOCTL_CODES + WinKernel::Constants::TARGET_IOCTL_COUNT);
+        }
+        const size_t ioctlCount = activeIoctls.size();
+
+        // [수정] 구조적 랜덤 IOCTL 모드용 시드 코퍼스(uint32_t). 리스트 모드에서는 사용되지 않는다.
+        const std::vector<uint32_t> ioctlCorpus(
+            WinKernel::Constants::HEVD_IOCTL_CORPUS,
+            WinKernel::Constants::HEVD_IOCTL_CORPUS + WinKernel::Constants::HEVD_IOCTL_CORPUS_COUNT);
+
+        // [수정] 크기 범위 정합성 보정(역전/0 방지). 상한은 온-와이어 스냅샷 상한과 무관하게 실제 커널 전송 크기.
+        if (minSize == 0) minSize = 1;
+        if (maxSize < minSize) maxSize = minSize;
+
+        // 활성 IOCTL 목록을 사람이 읽을 수 있는 형태로 로깅(첫 IOCTL 기준 표기 + 개수).
+        std::wstring ioctlListStr;
+        for (size_t k = 0; k < ioctlCount; ++k) {
+            ioctlListStr += std::format(L"{}0x{:X}", (k == 0 ? L"" : L", "), activeIoctls[k]);
+        }
+
         DWORD currentPid = GetCurrentProcessId();
         logger.Log(L"---", L"================================================================================");
         logger.Log(L"NEW_RUN", std::format(
-            L"Worker {} Lifecycle Started | PID: {} | Seed: 0x{:08X} | Target IOCTL: 0x{:X}",
-            workerId, currentPid, seed, WinKernel::Constants::TARGET_IOCTL_CODE
+            L"Worker {} Lifecycle Started | PID: {} | Seed: 0x{:08X} | Mode: {} | Target IOCTL(s): [{}] | Size: {}..{}",
+            workerId, currentPid, seed,
+            (ioctlRandom ? L"RANDOM(corpus-guided)" : L"LIST"),
+            (ioctlRandom ? std::format(L"corpus x{}, func 0x{:X}..0x{:X}",
+                WinKernel::Constants::HEVD_IOCTL_CORPUS_COUNT,
+                WinKernel::Constants::IOCTL_FUNC_MIN, WinKernel::Constants::IOCTL_FUNC_MAX)
+                : ioctlListStr),
+            minSize, maxSize
         ));
         logger.Log(L"---", L"================================================================================");
 
@@ -93,21 +129,29 @@ export namespace WinKernel::Worker {
         auto startTime = std::chrono::steady_clock::now();
 
         // [Design: 호스트 주도 시작점] 첫 패스만 startIoctlIdx부터, 이후 패스는 전 범위 순회 (범위 밖이면 0으로 보정)
-        size_t startIdx = (startIoctlIdx < WinKernel::Constants::TARGET_IOCTL_COUNT) ? startIoctlIdx : 0;
+        size_t startIdx = (startIoctlIdx < ioctlCount) ? startIoctlIdx : 0;
         bool firstPass = true;
-
-        // [Fix: 가변 크기 이스케일레이션 제거] 모든 페이로드를 DEFAULT_BUFFER_SIZE(4096, PAGE_SIZE)로 고정해 드라이버를 직격.
-        constexpr uint32_t fixedSize = WinKernel::Constants::DEFAULT_BUFFER_SIZE;
-        const std::vector<uint8_t> basePayload(fixedSize, 0x41);
 
         while (true) {
             const size_t beginIdx = firstPass ? startIdx : 0;
             firstPass = false;
-            for (size_t ioctlIdx = beginIdx; ioctlIdx < WinKernel::Constants::TARGET_IOCTL_COUNT; ++ioctlIdx) {
-                const DWORD ioctlCode = WinKernel::Constants::TARGET_IOCTL_CODES[ioctlIdx];
+            // [수정] 랜덤 모드는 고정 리스트를 순회하지 않고 단일 스트림으로 IOCTL을 매 반복 생성한다.
+            const size_t loopCount = ioctlRandom ? static_cast<size_t>(1) : ioctlCount;
+            for (size_t ioctlIdx = (ioctlRandom ? static_cast<size_t>(0) : beginIdx);
+                 ioctlIdx < loopCount; ++ioctlIdx) {
 
                 for (uint32_t rep = 0; rep < WinKernel::Constants::ITERATIONS_PER_PROFILE; ++rep) {
                     iteration++;
+
+                    // [수정] IOCTL 결정: 리스트 모드는 고정 코드(난수 미소모 -> 검증 재현성 불변),
+                    //   랜덤 모드는 코퍼스 기반 구조적 생성(동일 시드 -> 동일 IOCTL 시퀀스 -> 크래시 리플레이 가능).
+                    const DWORD ioctlCode = ioctlRandom
+                        ? static_cast<DWORD>(mutator.NextIoctl(
+                              ioctlCorpus, WinKernel::Constants::IOCTL_EXPLOIT_PCT,
+                              WinKernel::Constants::TARGET_DEVICE_TYPE,
+                              WinKernel::Constants::IOCTL_FUNC_MIN, WinKernel::Constants::IOCTL_FUNC_MAX,
+                              WinKernel::Constants::IOCTL_METHOD_RANDOM_PCT))
+                        : activeIoctls[ioctlIdx];
 
                     if (iteration >= WinKernel::Constants::MAX_WORKER_ITERATIONS) {
                         auto endTime = std::chrono::steady_clock::now();
@@ -116,7 +160,7 @@ export namespace WinKernel::Worker {
 
                         // [TCP 전환] 정상 완주를 호스트가 유죄로 오탐하지 않도록 Completed 통지 후 소켓 정상 종료(FIN).
                         reporter.Report(WorkerPhase::Completed, ioctlCode, seed,
-                            fixedSize, fixedSize, iteration, 0, nullptr, 0);
+                            0, 0, iteration, 0, nullptr, 0);
 
                         logger.Log(L"SUMMARY", std::format(
                             L"Worker {} completed {} iterations in {:.2f}s ({:.0f} exec/s). Recycling...",
@@ -126,13 +170,16 @@ export namespace WinKernel::Worker {
                         return;
                     }
 
-                    std::vector<uint8_t> fuzzPayload = basePayload;
-                    mutator.Mutate(fuzzPayload); // 4096바이트 고정 버퍼 내부 콘텐츠만 변조 (크기는 불변)
+                    // [수정] 매 반복 크기를 가변 선택 후 그 크기의 페이로드를 생성·변조(크기 자체가 퍼징 축이 된다).
+                    const uint32_t curSize = mutator.NextSize(minSize, maxSize);
+                    std::vector<uint8_t> fuzzPayload(curSize, 0x41);
+                    mutator.Mutate(fuzzPayload); // 가변 크기 버퍼 내부 콘텐츠 변조
 
                     // [TCP 전환: 유죄 후보 사전 스냅샷] 커널 진입 '직전' InIoctl 패킷을 호스트 RAM으로 직접 스트리밍.
                     // 디스크/HGFS 경유가 없으므로, BSOD로 소켓이 끊기면 이 마지막 패킷이 그대로 유죄 근거가 된다.
+                    // declaredSize/actualSize에 실제 커널 전송 크기(curSize)를 실어 호스트가 임계 크기를 분석할 수 있게 한다.
                     reporter.Report(WorkerPhase::InIoctl, ioctlCode, seed,
-                        fixedSize, fixedSize, iteration, 0,
+                        curSize, curSize, iteration, 0,
                         fuzzPayload.data(), static_cast<uint32_t>(fuzzPayload.size()));
 
                     // [Fix: 패킷 없는 BSOD 원천 차단] InIoctl 스냅샷 송신이 실패(소켓 절단)했다면 이 IOCTL은 호스트에
@@ -160,7 +207,7 @@ export namespace WinKernel::Worker {
                         for (uint64_t k : sehReportedKeys) { if (k == sehKey) { sehAlready = true; break; } }
                         if (!sehAlready) {
                             reporter.Report(WorkerPhase::Crashed, ioctlCode, seed,
-                                fixedSize, fixedSize, iteration, sehCode,
+                                curSize, curSize, iteration, sehCode,
                                 fuzzPayload.data(), static_cast<uint32_t>(fuzzPayload.size()));
                             sehReportedKeys.push_back(sehKey);
                         }
@@ -169,7 +216,7 @@ export namespace WinKernel::Worker {
                         if (sehAbsorbed == 1 || (sehAbsorbed % 1000) == 0) {
                             logger.Log(L"SEH", std::format(
                                 L"OS exception 0x{:08X} absorbed (#{}) | IOCTL 0x{:X} Seed 0x{:08X} size {} iter {} -> continue",
-                                sehCode, sehAbsorbed, ioctlCode, seed, fixedSize, iteration));
+                                sehCode, sehAbsorbed, ioctlCode, seed, curSize, iteration));
                         }
                         continue; // 안쪽 for(rep) 다음 반복으로 -> 프로세스 종료 없이 연속 퍼징(자가 회복)
                     }

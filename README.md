@@ -119,3 +119,19 @@ This project is for educational and vulnerability research purposes only. It is 
 **기본 페이로드 버퍼 확장 (4096 바이트):** HEVD(x64) 스택 버퍼 크기($0x800$, 2048 바이트)를 안정적으로 초과하여 커널 패닉(BSOD / BugCheck)을 유발할 수 있도록 `DEFAULT_BUFFER_SIZE`를 4096 바이트로 상향.
 
 **워커 수명 주기 최적화 (700만 회):** 프로세스 재생성 오버헤드를 줄이고 장기 가동률을 극대화하기 위해 워커 리사이클 주기를 7,000,000회로 확장.
+
+---
+
+0.6.2 버그 픽스 — IOCTL/시드 파라미터 분리 및 가변 크기 퍼징 도입
+
+**[BUG] IOCTL 코드와 뮤테이션 시드 혼동으로 인한 크래시 오귀속 및 페이로드 크기 고정으로 인한 탐색 무력화:** `0x222003`뿐 아니라 임의로 지정한 `0x222004`에서도 동일하게 BSOD가 재현되어 퍼저 자체의 논리적 결함(False Positive)이 의심되었으나, 원인은 (1) 호스트가 IOCTL 코드 대신 뮤테이션 시드(`base_seed`) 파라미터를 재활용해 실제 IOCTL은 전혀 바뀌지 않았고, (2) 페이로드가 4096바이트로 고정되어 HEVD 스택 버퍼(~2048바이트)를 매 반복 결정론적으로 초과했기 때문임을 규명. 상세 재현·근거·대조 실험 데이터는 [`BUGREPORT_IOCTL_SeedConfusion_FixedSize.md`](BUGREPORT_IOCTL_SeedConfusion_FixedSize.md) 참고.
+
+**타깃 IOCTL CLI 인자화:** `main.cpp`/`WinKernel.Worker.ixx`/`WinKernel.Manager.ixx`에 `--ioctl 0xNNN`(다중 지정 가능) 플래그를 추가하고, `monitoring.py`에 `TARGET_IOCTLS` 설정을 도입하여 뮤테이션 시드(`base_seed`)와 타깃 IOCTL 코드를 완전히 독립된 파라미터로 분리. 과거 `base_seed = 0x222004` 강제 고정 디버그 해킹 코드 제거.
+
+**가변 페이로드 크기 퍼징:** 고정 4096바이트 페이로드를 폐기하고, `WinKernel.Mutator.ixx::NextSize()`가 매 반복 `[1, 8192]` 범위에서 커널 버퍼 임계값(2047/2048/2049 등) 부근을 집중 타격하는 크기를 결정론적으로 선택하도록 변경. 이를 통해 크기가 임계 미만이면 생존, 초과 시에만 크래시가 발생하는 실제 탐색이 가능해짐.
+
+**코퍼스 유도 구조적 랜덤 IOCTL 모드(`--ioctl-random` / `IOCTL_MODE=random`):** 완전 균일 32비트 랜덤은 device type 불일치로 대부분 무크래시 낭비임이 실증되어, 알려진 HEVD 유효 코드 재사용(70%, exploitation)과 `CTL_CODE` 구조를 지킨 인접 Function 탐색(30%, exploration)을 결합한 실무형 랜덤 모드를 opt-in으로 추가. 기본값은 기존 결정론 리스트 모드로 유지해 검증된 재현 경로를 보존.
+
+**실시간 진단 로그 보강:** 크래시/유죄 후보 로그에 설정 "크기 범위"만 표시되어 실제 발동 크기를 알 수 없던 문제를 해결. `[SAVED:BSOD...]` 등 실시간 로그에 해당 케이스에서 실제로 사용된 단일 페이로드 크기를 표기하도록 수정.
+
+**대조 실험을 통한 True Positive 실증:** 동일 조건(페이로드 생성 로직·크기 범위)에서 IOCTL만 다르게 하여, `0x222004`(HEVD 미정의)는 700만 회 완주 크래시 0건, `0x222003`(스택 오버플로우)은 임계 초과 크기(8020B)에서 즉시 BSOD를 재현. 크래시가 퍼저 결함이 아닌 드라이버 본래의 취약점임을 실험적으로 확정.

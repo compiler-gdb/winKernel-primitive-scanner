@@ -125,6 +125,13 @@ export namespace WinKernel {
 		constexpr DWORD MAX_WORKERS = 32;
 		constexpr DWORD DEFAULT_BUFFER_SIZE = 4096;
 
+		// [가변 크기 퍼징] 페이로드 크기를 매 반복 이 범위에서 무작위(시드 결정론)로 선택한다.
+		// 기존처럼 크기를 4096으로 고정하면 HEVD 스택 버퍼(~2048B)를 무조건 넘겨 "모든 반복이 크래시"가 되어
+		// 시드/변조가 크래시 발생 여부와 무관해진다. 크기를 [MIN, MAX]로 흔들어 임계값 미만(음성)과
+		// 초과(양성)를 모두 관측할 수 있게 하여 실제 탐색이 성립하도록 한다.
+		constexpr uint32_t MIN_PAYLOAD_SIZE = 1;
+		constexpr uint32_t MAX_PAYLOAD_SIZE = 8192;
+
 		constexpr wchar_t TARGET_DRIVER_NAME[] = L"HackSysExtremeVulnerableDriver";
 		constexpr DWORD TARGET_IOCTL_CODE = 0x222003;
 		constexpr uint64_t MAX_WORKER_ITERATIONS = 7'000'000;
@@ -134,6 +141,26 @@ export namespace WinKernel {
 		// [Fix: '다음 IOCTL로 진행' 요구 대응] 순차 검증할 타깃 IOCTL 목록 (확장 가능)
 		constexpr DWORD TARGET_IOCTL_CODES[] = { 0x222003 };
 		constexpr size_t TARGET_IOCTL_COUNT = sizeof(TARGET_IOCTL_CODES) / sizeof(TARGET_IOCTL_CODES[0]);
+
+		// [실무형 구조적 랜덤 IOCTL] 시드 코퍼스 + CTL_CODE 구조 변이 기반의 '재현 가능한' 랜덤 모드 프로파일.
+		//   완전 32비트 균일 랜덤은 device type 불일치로 거의 전부 default 분기(무크래시)라 비효율적이다.
+		//   대신 알려진 유효 코드를 재사용(exploitation)하고, CTL_CODE 레이아웃을 지켜 인접 공간만 탐색(exploration)한다.
+		//   이 모드는 opt-in(--ioctl-random)이며, 기본 리스트 모드(TARGET_IOCTLS)는 그대로 두어 검증 재현성을 해치지 않는다.
+		constexpr uint32_t HEVD_IOCTL_CORPUS[] = {
+			0x222003, // BUFFER_OVERFLOW_STACK
+			0x222007, // BUFFER_OVERFLOW_STACK_GS
+			0x22200B, // ARBITRARY_OVERWRITE
+			0x22200F, // POOL_OVERFLOW
+			0x222013, // ALLOCATE_UAF_OBJECT
+			0x222017, // USE_UAF_OBJECT
+			0x22201B, // FREE_UAF_OBJECT
+		};
+		constexpr size_t HEVD_IOCTL_CORPUS_COUNT = sizeof(HEVD_IOCTL_CORPUS) / sizeof(HEVD_IOCTL_CORPUS[0]);
+		constexpr uint16_t TARGET_DEVICE_TYPE = 0x22;    // HEVD 의 FILE_DEVICE_UNKNOWN 대역(CTL_CODE 상위 16비트)
+		constexpr uint32_t IOCTL_FUNC_MIN = 0x800;       // HEVD Function 시작 번호
+		constexpr uint32_t IOCTL_FUNC_MAX = 0x8FF;       // 인접 미정의 Function 까지 탐색 상한
+		constexpr uint32_t IOCTL_EXPLOIT_PCT = 70;       // 이 %만큼 코퍼스(알려진 유효 코드) 재사용, 나머지는 구조적 탐색
+		constexpr uint32_t IOCTL_METHOD_RANDOM_PCT = 10; // 이 %만큼 method 무작위(그 외에는 METHOD_NEITHER=3 유지)
 
 		// IOCTL당 4096바이트 고정 페이로드로 수행할 변조 반복 횟수
 		constexpr uint32_t ITERATIONS_PER_PROFILE = 256;

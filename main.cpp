@@ -34,12 +34,26 @@ int wmain(int argc, wchar_t* argv[]) {
             size_t startIoctlIdx = 0;
             int positional = 0;
 
+            // [수정] IOCTL/크기 CLI 개방: --ioctl 는 반복 지정 가능(목록 구성), --min-size/--max-size 로 가변 크기 범위 지정.
+            std::vector<DWORD> ioctlOverride;
+            uint32_t minSize = WinKernel::Constants::MIN_PAYLOAD_SIZE;
+            uint32_t maxSize = WinKernel::Constants::MAX_PAYLOAD_SIZE;
+            bool ioctlRandom = false; // [수정] opt-in 구조적 랜덤 IOCTL 모드
+
             for (int i = 4; i < argc; ++i) {
                 const std::wstring a = argv[i];
                 if (a == L"--report-host" && (i + 1) < argc) {
                     reportHost = argv[++i];
                 } else if (a == L"--report-port" && (i + 1) < argc) {
                     reportPort = static_cast<uint16_t>(std::wcstoul(argv[++i], nullptr, 0));
+                } else if (a == L"--ioctl" && (i + 1) < argc) {
+                    ioctlOverride.push_back(static_cast<DWORD>(std::wcstoul(argv[++i], nullptr, 0))); // 0x 접두사 자동 인식
+                } else if (a == L"--ioctl-random") {
+                    ioctlRandom = true;
+                } else if (a == L"--min-size" && (i + 1) < argc) {
+                    minSize = static_cast<uint32_t>(std::wcstoul(argv[++i], nullptr, 0));
+                } else if (a == L"--max-size" && (i + 1) < argc) {
+                    maxSize = static_cast<uint32_t>(std::wcstoul(argv[++i], nullptr, 0));
                 } else if (positional == 0) {
                     injectedSeed = static_cast<uint32_t>(std::wcstoul(a.c_str(), nullptr, 0)); // 0x 접두사 자동 인식
                     useInjectedSeed = true;
@@ -51,7 +65,7 @@ int wmain(int argc, wchar_t* argv[]) {
             }
 
             WinKernel::Worker::Run(workerId, sessionDir, useInjectedSeed, injectedSeed, startIoctlIdx,
-                reportHost, reportPort);
+                reportHost, reportPort, ioctlOverride, minSize, maxSize, ioctlRandom);
             return 0;
         }
 
@@ -60,6 +74,12 @@ int wmain(int argc, wchar_t* argv[]) {
         bool baseSeedProvided = false;
         size_t startIoctlIdx = 0;
         int positional = 0;
+
+        // [수정] 마스터도 워커와 동일하게 IOCTL/크기 CLI 를 수용해 자식 워커 커맨드라인에 전파한다.
+        std::vector<DWORD> ioctlOverride;
+        uint32_t minSize = WinKernel::Constants::MIN_PAYLOAD_SIZE;
+        uint32_t maxSize = WinKernel::Constants::MAX_PAYLOAD_SIZE;
+        bool ioctlRandom = false; // [수정] opt-in 구조적 랜덤 IOCTL 모드
 
         for (int i = 1; i < argc; ++i) {
             const std::wstring a = argv[i];
@@ -72,6 +92,14 @@ int wmain(int argc, wchar_t* argv[]) {
                 reportHost = argv[++i];
             } else if (a == L"--report-port" && (i + 1) < argc) {
                 reportPort = static_cast<uint16_t>(std::wcstoul(argv[++i], nullptr, 0));
+            } else if (a == L"--ioctl" && (i + 1) < argc) {
+                ioctlOverride.push_back(static_cast<DWORD>(std::wcstoul(argv[++i], nullptr, 0)));
+            } else if (a == L"--ioctl-random") {
+                ioctlRandom = true;
+            } else if (a == L"--min-size" && (i + 1) < argc) {
+                minSize = static_cast<uint32_t>(std::wcstoul(argv[++i], nullptr, 0));
+            } else if (a == L"--max-size" && (i + 1) < argc) {
+                maxSize = static_cast<uint32_t>(std::wcstoul(argv[++i], nullptr, 0));
             } else {
                 switch (positional++) {
                 case 0: reportHost = a; break;                                            // argv[1] = 호스트 IP
@@ -90,7 +118,8 @@ int wmain(int argc, wchar_t* argv[]) {
         }
 
         WinKernel::Manager::MasterController master;
-        return master.Run(baseSeed, baseSeedProvided, startIoctlIdx, reportHost, reportPort);
+        return master.Run(baseSeed, baseSeedProvided, startIoctlIdx, reportHost, reportPort,
+            ioctlOverride, minSize, maxSize, ioctlRandom);
 
     }
     catch (const std::exception& e) {
